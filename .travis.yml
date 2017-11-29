@@ -16,14 +16,14 @@ matrix:
       if: type = pull_request OR branch = auto
 
     - env: IMAGE=dist-x86_64-linux DEPLOY=1
-      if: branch = auto
+      if: branch = try OR branch = auto
 
     # "alternate" deployments, these are "nightlies" but don't have assertions
     # turned on, they're deployed to a different location primarily for projects
     # which are stuck on nightly and don't want llvm assertions in the artifacts
     # that they use.
     - env: IMAGE=dist-x86_64-linux DEPLOY_ALT=1
-      if: branch = try OR branch = auto
+      if: branch = auto
 
     - env: >
         RUST_CHECK_TARGET=dist
