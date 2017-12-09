@@ -25,12 +25,14 @@ use rustc::util::nodemap::FxHashSet;
 use rustc::infer::{self, InferOk};
 use syntax::ast;
 use syntax::util::lev_distance::{lev_distance, find_best_match_for_name};
+use syntax::symbol::Symbol;
 use syntax_pos::Span;
 use rustc::hir;
 use std::mem;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::cmp::max;
+
 
 use self::CandidateKind::*;
 pub use self::PickKind::*;
@@ -220,6 +222,99 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                       scope_expr_id,
                       scope,
                       |probe_cx| probe_cx.pick())
+    }
+
+    fn probe_for_operator(&'a self,
+                      span: Span,
+                      mode: Mode,
+                      operator: hir::BinOp,
+                      is_assign: bool,
+                      return_type: Option<Ty<'tcx>>,
+                      is_suggestion: IsSuggestion,
+                      self_ty: Ty<'tcx>,
+                      scope_expr_id: ast::NodeId)
+                      -> PickResult<'tcx>
+    {
+        let steps = if mode == Mode::MethodCall {
+            match self.create_steps(span, self_ty, is_suggestion) {
+                Some(steps) => steps,
+                None => {
+                    return Err(MethodError::NoMatch(NoMatchData::new(Vec::new(),
+                                                                     Vec::new(),
+                                                                     Vec::new(),
+                                                                     None,
+                                                                     mode)))
+                }
+            }
+        } else {
+            vec![CandidateStep {
+                self_ty,
+                autoderefs: 0,
+                unsize: false,
+            }]
+        };
+
+        debug!("ProbeContext: steps for self_ty={:?} are {:?}",
+               self_ty,
+               steps);
+
+        // this creates one big transaction so that all type variables etc
+        // that we create during the probe process are removed later
+        self.probe(|_| {
+            let lang = self.tcx.lang_items();
+
+            let (opname, trait_did) = if is_assign {
+                match operator.node {
+                    hir::BiAdd => ("add_assign", lang.add_assign_trait()),
+                    hir::BiSub => ("sub_assign", lang.sub_assign_trait()),
+                    hir::BiMul => ("mul_assign", lang.mul_assign_trait()),
+                    hir::BiDiv => ("div_assign", lang.div_assign_trait()),
+                    hir::BiRem => ("rem_assign", lang.rem_assign_trait()),
+                    hir::BiBitXor => ("bitxor_assign", lang.bitxor_assign_trait()),
+                    hir::BiBitAnd => ("bitand_assign", lang.bitand_assign_trait()),
+                    hir::BiBitOr => ("bitor_assign", lang.bitor_assign_trait()),
+                    hir::BiShl => ("shl_assign", lang.shl_assign_trait()),
+                    hir::BiShr => ("shr_assign", lang.shr_assign_trait()),
+                    hir::BiLt | hir::BiLe |
+                    hir::BiGe | hir::BiGt |
+                    hir::BiEq | hir::BiNe |
+                    hir::BiAnd | hir::BiOr => {
+                        span_bug!(span,
+                              "impossible assignment operation: {}=",
+                              operator.node.as_str())
+                    }
+                }
+            } else {
+                match operator.node {
+                    hir::BiAdd => ("add", lang.add_trait()),
+                    hir::BiSub => ("sub", lang.sub_trait()),
+                    hir::BiMul => ("mul", lang.mul_trait()),
+                    hir::BiDiv => ("div", lang.div_trait()),
+                    hir::BiRem => ("rem", lang.rem_trait()),
+                    hir::BiBitXor => ("bitxor", lang.bitxor_trait()),
+                    hir::BiBitAnd => ("bitand", lang.bitand_trait()),
+                    hir::BiBitOr => ("bitor", lang.bitor_trait()),
+                    hir::BiShl => ("shl", lang.shl_trait()),
+                    hir::BiShr => ("shr", lang.shr_trait()),
+                    hir::BiLt => ("lt", lang.ord_trait()),
+                    hir::BiLe => ("le", lang.ord_trait()),
+                    hir::BiGe => ("ge", lang.ord_trait()),
+                    hir::BiGt => ("gt", lang.ord_trait()),
+                    hir::BiEq => ("eq", lang.eq_trait()),
+                    hir::BiNe => ("ne", lang.eq_trait()),
+                    hir::BiAnd | hir::BiOr => {
+                        span_bug!(span, "&& and || are not overloadable")
+                    }
+                }
+            };
+
+            let mut probe_cx =
+                ProbeContext::new(self, span, mode, Some(Symbol::intern(opname)), return_type, Rc::new(steps));
+
+            probe_cx.assemble_extension_candidates_for_trait(Some(scope_expr_id), trait_did.unwrap())?;
+
+            probe_cx.pick_core().unwrap()
+        })
     }
 
     fn probe_op<OP,R>(&'a self,
