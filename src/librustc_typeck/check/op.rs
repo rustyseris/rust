@@ -20,6 +20,7 @@ use errors;
 use syntax_pos::Span;
 use syntax::symbol::Symbol;
 use rustc::hir;
+use check::method::probe::IsSuggestion;
 
 impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
     /// Check a `a <op>= b`
@@ -188,7 +189,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         // particularly for things like `String + &String`.
         let rhs_ty_var = self.next_ty_var(TypeVariableOrigin::MiscVariable(rhs_expr.span));
 
-        let result = self.lookup_op_method(lhs_ty, &[rhs_ty_var], Op::Binary(op, is_assign));
+        let result = self.lookup_op_method(lhs_ty, &[rhs_ty_var], Op::Binary(op, is_assign), expr);
 
         // see `NB` above
         let rhs_ty = self.check_expr_coercable_to_type(rhs_expr, rhs_ty_var);
@@ -254,7 +255,8 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                                                   lhs_expr.span) &&
                                     self.lookup_op_method(ty_mut.ty,
                                                           &[rhs_ty],
-                                                          Op::Binary(op, is_assign))
+                                                          Op::Binary(op, is_assign),
+                                                          expr)
                                         .is_ok()
                             } {
                                 err.note(
@@ -348,7 +350,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                            -> Ty<'tcx>
     {
         assert!(op.is_by_value());
-        match self.lookup_op_method(operand_ty, &[], Op::Unary(op, ex.span)) {
+        match self.lookup_op_method(operand_ty, &[], Op::Unary(op, ex.span), ex) {
             Ok(method) => {
                 self.write_method_call(ex.hir_id, method);
                 method.sig.output()
@@ -365,7 +367,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         }
     }
 
-    fn lookup_op_method(&self, lhs_ty: Ty<'tcx>, other_tys: &[Ty<'tcx>], op: Op)
+    fn lookup_op_method(&self, lhs_ty: Ty<'tcx>, other_tys: &[Ty<'tcx>], op: Op, call_expr: &'gcx hir::Expr)
                         -> Result<MethodCallee<'tcx>, ()>
     {
         let lang = self.tcx.lang_items();
@@ -374,6 +376,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
             Op::Binary(op, _) => op.span,
             Op::Unary(_, span) => span
         };
+
         let (opname, trait_did) = if let Op::Binary(op, IsAssign::Yes) = op {
             match op.node {
                 hir::BiAdd => ("add_assign", lang.add_assign_trait()),
@@ -431,9 +434,17 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                opname,
                trait_did);
 
+        let rhs_ty = if other_tys.len() == 1 {
+            Some(other_tys[0])
+        } else {
+            None
+        };
+
         let method = trait_did.and_then(|trait_did| {
             let opname = Symbol::intern(opname);
-            self.lookup_method_in_trait(span, opname, trait_did, lhs_ty, Some(other_tys))
+            self.probe_for_operator_method(span, opname, trait_did,
+                                           None, IsSuggestion(false),
+                                           lhs_ty, rhs_ty, call_expr.id)
         });
 
         match method {

@@ -39,6 +39,7 @@ pub use self::PickKind::*;
 
 /// Boolean flag used to indicate if this search is for a suggestion
 /// or not.  If true, we can allow ambiguity and so forth.
+#[derive(Copy, Clone)]
 pub struct IsSuggestion(pub bool);
 
 struct ProbeContext<'a, 'gcx: 'a + 'tcx, 'tcx: 'a> {
@@ -48,6 +49,7 @@ struct ProbeContext<'a, 'gcx: 'a + 'tcx, 'tcx: 'a> {
     method_name: Option<ast::Name>,
     return_type: Option<Ty<'tcx>>,
     steps: Rc<Vec<CandidateStep<'tcx>>>,
+    rhs_steps: Option<Rc<Vec<CandidateStep<'tcx>>>>,
     inherent_candidates: Vec<Candidate<'tcx>>,
     extension_candidates: Vec<Candidate<'tcx>>,
     impl_dups: FxHashSet<DefId>,
@@ -85,6 +87,7 @@ struct CandidateStep<'tcx> {
 #[derive(Debug)]
 struct Candidate<'tcx> {
     xform_self_ty: Ty<'tcx>,
+    xform_rhs_ty: Option<Ty<'tcx>>,
     xform_ret_ty: Option<Ty<'tcx>>,
     item: ty::AssociatedItem,
     kind: CandidateKind<'tcx>,
@@ -224,97 +227,64 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                       |probe_cx| probe_cx.pick())
     }
 
-    fn probe_for_operator(&'a self,
-                      span: Span,
-                      mode: Mode,
-                      operator: hir::BinOp,
-                      is_assign: bool,
-                      return_type: Option<Ty<'tcx>>,
-                      is_suggestion: IsSuggestion,
-                      self_ty: Ty<'tcx>,
-                      scope_expr_id: ast::NodeId)
-                      -> PickResult<'tcx>
-    {
-        let steps = if mode == Mode::MethodCall {
-            match self.create_steps(span, self_ty, is_suggestion) {
-                Some(steps) => steps,
-                None => {
-                    return Err(MethodError::NoMatch(NoMatchData::new(Vec::new(),
-                                                                     Vec::new(),
-                                                                     Vec::new(),
-                                                                     None,
-                                                                     mode)))
-                }
+    pub fn probe_for_operator_method(&'a self,
+                          span: Span,
+                          op_method_name: ast::Name,
+                          op_trait: DefId,
+                          return_type: Option<Ty<'tcx>>,
+                          is_suggestion: IsSuggestion,
+                          lhs_ty: Ty<'tcx>,
+                          rhs_ty: Option<Ty<'tcx>>,
+                          scope_expr_id: ast::NodeId) -> PickResult<'tcx> {
+        debug!("probe(op_method_name={:?}, lhs_ty={:?}, rhs_ty={:?}, return_type={:?}, scope_expr_id={})",
+               op_method_name,
+               lhs_ty,
+               rhs_ty,
+               return_type,
+               scope_expr_id);
+
+        let lhs_steps_result = self.create_steps(span, scope_expr_id, lhs_ty, is_suggestion);
+        let rhs_steps_result_opt = rhs_ty.map(|ty| {
+            self.create_steps(span, scope_expr_id, ty, is_suggestion)
+        });
+
+        let lhs_steps = match lhs_steps_result {
+            Some(steps) => steps,
+            None => {
+                return FnCtxt::probing_error();
             }
-        } else {
-            vec![CandidateStep {
-                self_ty,
-                autoderefs: 0,
-                unsize: false,
-            }]
         };
 
-        debug!("ProbeContext: steps for self_ty={:?} are {:?}",
-               self_ty,
-               steps);
+        let rhs_steps_opt = match rhs_steps_result_opt {
+            Some(Some(steps)) => Some(Rc::new(steps)),
+            Some(None) => {
+                return FnCtxt::probing_error();
+            },
+            None => None
+        };
 
-        // this creates one big transaction so that all type variables etc
-        // that we create during the probe process are removed later
+        debug!("Probe Context: steps for lhs_ty={:?} are {:?}", lhs_ty, lhs_steps);
+        debug!("Probe Context: steps for rhs_ty={:?} are {:?}", rhs_ty, rhs_steps_opt);
+
         self.probe(|_| {
-            let lang = self.tcx.lang_items();
+            let mut probe_cx = ProbeContext::new(self, span, Mode::MethodCall,
+                                                 Some(op_method_name), return_type,
+                                                 Rc::new(lhs_steps), rhs_steps_opt);
 
-            let (opname, trait_did) = if is_assign {
-                match operator.node {
-                    hir::BiAdd => ("add_assign", lang.add_assign_trait()),
-                    hir::BiSub => ("sub_assign", lang.sub_assign_trait()),
-                    hir::BiMul => ("mul_assign", lang.mul_assign_trait()),
-                    hir::BiDiv => ("div_assign", lang.div_assign_trait()),
-                    hir::BiRem => ("rem_assign", lang.rem_assign_trait()),
-                    hir::BiBitXor => ("bitxor_assign", lang.bitxor_assign_trait()),
-                    hir::BiBitAnd => ("bitand_assign", lang.bitand_assign_trait()),
-                    hir::BiBitOr => ("bitor_assign", lang.bitor_assign_trait()),
-                    hir::BiShl => ("shl_assign", lang.shl_assign_trait()),
-                    hir::BiShr => ("shr_assign", lang.shr_assign_trait()),
-                    hir::BiLt | hir::BiLe |
-                    hir::BiGe | hir::BiGt |
-                    hir::BiEq | hir::BiNe |
-                    hir::BiAnd | hir::BiOr => {
-                        span_bug!(span,
-                              "impossible assignment operation: {}=",
-                              operator.node.as_str())
-                    }
-                }
-            } else {
-                match operator.node {
-                    hir::BiAdd => ("add", lang.add_trait()),
-                    hir::BiSub => ("sub", lang.sub_trait()),
-                    hir::BiMul => ("mul", lang.mul_trait()),
-                    hir::BiDiv => ("div", lang.div_trait()),
-                    hir::BiRem => ("rem", lang.rem_trait()),
-                    hir::BiBitXor => ("bitxor", lang.bitxor_trait()),
-                    hir::BiBitAnd => ("bitand", lang.bitand_trait()),
-                    hir::BiBitOr => ("bitor", lang.bitor_trait()),
-                    hir::BiShl => ("shl", lang.shl_trait()),
-                    hir::BiShr => ("shr", lang.shr_trait()),
-                    hir::BiLt => ("lt", lang.ord_trait()),
-                    hir::BiLe => ("le", lang.ord_trait()),
-                    hir::BiGe => ("ge", lang.ord_trait()),
-                    hir::BiGt => ("gt", lang.ord_trait()),
-                    hir::BiEq => ("eq", lang.eq_trait()),
-                    hir::BiNe => ("ne", lang.eq_trait()),
-                    hir::BiAnd | hir::BiOr => {
-                        span_bug!(span, "&& and || are not overloadable")
-                    }
-                }
-            };
+            probe_cx.assemble_extension_candidates_for_trait(Some(scope_expr_id),
+                                                             op_trait)?;
 
-            let mut probe_cx =
-                ProbeContext::new(self, span, mode, Some(Symbol::intern(opname)), return_type, Rc::new(steps));
-
-            probe_cx.assemble_extension_candidates_for_trait(Some(scope_expr_id), trait_did.unwrap())?;
-
-            probe_cx.pick_core().unwrap()
+            probe_cx.pick()
         })
+    }
+
+    fn probing_error() -> PickResult<'tcx> {
+        Err(MethodError::NoMatch(NoMatchData::new(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            Mode::MethodCall)))
     }
 
     fn probe_op<OP,R>(&'a self,
@@ -341,11 +311,12 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
             match self.create_steps(span, self_ty, is_suggestion) {
                 Some(steps) => steps,
                 None => {
-                    return Err(MethodError::NoMatch(NoMatchData::new(Vec::new(),
-                                                                     Vec::new(),
-                                                                     Vec::new(),
-                                                                     None,
-                                                                     mode)))
+                    return Err(MethodError::NoMatch(NoMatchData::new(
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        None,
+                        Mode::MethodCall)));
                 }
             }
         } else {
@@ -364,7 +335,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         // that we create during the probe process are removed later
         self.probe(|_| {
             let mut probe_cx =
-                ProbeContext::new(self, span, mode, method_name, return_type, Rc::new(steps));
+                ProbeContext::new(self, span, mode, method_name, return_type, Rc::new(steps), None);
 
             probe_cx.assemble_inherent_candidates();
             match scope {
@@ -436,7 +407,8 @@ impl<'a, 'gcx, 'tcx> ProbeContext<'a, 'gcx, 'tcx> {
            mode: Mode,
            method_name: Option<ast::Name>,
            return_type: Option<Ty<'tcx>>,
-           steps: Rc<Vec<CandidateStep<'tcx>>>)
+           steps: Rc<Vec<CandidateStep<'tcx>>>,
+           rhs_steps: Option<Rc<Vec<CandidateStep<'tcx>>>>)
            -> ProbeContext<'a, 'gcx, 'tcx> {
         ProbeContext {
             fcx,
@@ -447,7 +419,8 @@ impl<'a, 'gcx, 'tcx> ProbeContext<'a, 'gcx, 'tcx> {
             inherent_candidates: Vec::new(),
             extension_candidates: Vec::new(),
             impl_dups: FxHashSet(),
-            steps: steps,
+            steps,
+            rhs_steps,
             static_candidates: Vec::new(),
             allow_similar_names: false,
             private_candidate: None,
@@ -641,7 +614,7 @@ impl<'a, 'gcx, 'tcx> ProbeContext<'a, 'gcx, 'tcx> {
                    xform_self_ty, xform_ret_ty);
 
             self.push_candidate(Candidate {
-                xform_self_ty, xform_ret_ty, item,
+                xform_self_ty, xform_rhs_ty: None, xform_ret_ty, item,
                 kind: InherentImplCandidate(impl_substs, obligations),
                 import_id: None
             }, true);
@@ -668,7 +641,7 @@ impl<'a, 'gcx, 'tcx> ProbeContext<'a, 'gcx, 'tcx> {
             let (xform_self_ty, xform_ret_ty) =
                 this.xform_self_ty(&item, new_trait_ref.self_ty(), new_trait_ref.substs);
             this.push_candidate(Candidate {
-                xform_self_ty, xform_ret_ty, item,
+                xform_self_ty, xform_rhs_ty: None, xform_ret_ty, item,
                 kind: ObjectCandidate,
                 import_id: None
             }, true);
@@ -720,7 +693,7 @@ impl<'a, 'gcx, 'tcx> ProbeContext<'a, 'gcx, 'tcx> {
             assert!(!trait_ref.substs.needs_infer());
 
             this.push_candidate(Candidate {
-                xform_self_ty, xform_ret_ty, item,
+                xform_self_ty, xform_rhs_ty: None, xform_ret_ty, item,
                 kind: WhereClauseCandidate(poly_trait_ref),
                 import_id: None
             }, true);
@@ -827,7 +800,7 @@ impl<'a, 'gcx, 'tcx> ProbeContext<'a, 'gcx, 'tcx> {
             let (xform_self_ty, xform_ret_ty) =
                 self.xform_self_ty(&item, trait_ref.self_ty(), trait_substs);
             self.push_candidate(Candidate {
-                xform_self_ty, xform_ret_ty, item, import_id,
+                xform_self_ty, xform_rhs_ty: None, xform_ret_ty, item, import_id,
                 kind: TraitCandidate(trait_ref),
             }, false);
         }
@@ -1245,7 +1218,7 @@ impl<'a, 'gcx, 'tcx> ProbeContext<'a, 'gcx, 'tcx> {
         let steps = self.steps.clone();
         self.probe(|_| {
             let mut pcx = ProbeContext::new(self.fcx, self.span, self.mode, self.method_name,
-                                            self.return_type, steps);
+                                            self.return_type, steps, None);
             pcx.allow_similar_names = true;
             pcx.assemble_inherent_candidates();
             pcx.assemble_extension_candidates_for_traits_in_scope(ast::DUMMY_NODE_ID)?;
